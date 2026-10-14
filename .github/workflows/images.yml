@@ -1,0 +1,100 @@
+name: Images
+
+# Builds the API and worker images on every relevant push to main, then promotes
+# the build to dev and prod. Infrastructure lives in the infra repo (Terraform);
+# this workflow only ships code. AWS access is keyless (OIDC → video-rag-ci role).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/api/**"
+      - "workers/ingest/**"
+      - "packages/**"
+      - ".dockerignore"
+      - ".github/workflows/images.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: images
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  build:
+    name: build ${{ matrix.image }}
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - image: api
+            dockerfile: apps/api/Dockerfile
+          - image: worker
+            dockerfile: workers/ingest/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and push
+        env:
+          IMAGE: ${{ vars.ECR_REGISTRY }}/video-rag-${{ matrix.image }}:sha-${{ github.sha }}
+        run: |
+          # Lambda rejects image indexes with attestations, so publish a plain manifest.
+          docker buildx build --platform linux/arm64 --provenance=false --sbom=false \
+            -f "${{ matrix.dockerfile }}" -t "$IMAGE" --push .
+
+  deploy-dev:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      DEPLOY_ENV: dev
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+    steps: &deploy-steps
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_CI_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Point the environment tag at this build
+        run: |
+          for image in api worker; do
+            manifest=$(aws ecr batch-get-image --repository-name "video-rag-$image" \
+              --image-ids imageTag="sha-$GITHUB_SHA" --query 'images[0].imageManifest' --output text)
+            aws ecr put-image --repository-name "video-rag-$image" --image-tag "$DEPLOY_ENV" \
+              --image-manifest "$manifest" > /dev/null 2> put-image.err \
+              || grep -q ImageAlreadyExistsException put-image.err
+            echo "video-rag-$image:$DEPLOY_ENV -> sha-$GITHUB_SHA"
+          done
+      - name: Deploy Lambda code
+        run: |
+          # The worker needs no step: Fargate pulls the environment tag on every task start.
+          for fn in api reranker; do
+            name="video-rag-$DEPLOY_ENV-$fn"
+            if aws lambda get-function --function-name "$name" > /dev/null 2>&1; then
+              aws lambda update-function-code --function-name "$name" \
+                --image-uri "$ECR_REGISTRY/video-rag-api:$DEPLOY_ENV" > /dev/null
+              aws lambda wait function-updated --function-name "$name"
+              echo "deployed $name"
+            else
+              echo "$name does not exist yet; skipping"
+            fi
+          done
+
+  deploy-prod:
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    environment: prod
+    env:
+      DEPLOY_ENV: prod
+      ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+    steps: *deploy-steps

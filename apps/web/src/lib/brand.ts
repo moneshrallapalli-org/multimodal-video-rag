@@ -13,7 +13,7 @@ export const brand = {
     "Ask questions over long-form talks and jump straight to the timestamped moment — grounded in both the visual frames and the spoken transcript.",
   author: "Monesh Rallapalli",
   portfolioUrl: "https://moneshrallapalli.com",
-  githubUrl: "https://github.com/moneshrallapalli/multimodal-video-rag",
+  githubUrl: "https://github.com/moneshrallapalli-org/multimodal-video-rag",
   nav: [
     { href: "/", label: "Search" },
     { href: "/admin", label: "Admin" },
